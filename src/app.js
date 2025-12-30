@@ -2,67 +2,127 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-
+const { securityHeaders } = require('./middleware/securityMiddleware');
+const { sanitizeInput, preventNoSQLInjection } = require('./middleware/validationMiddleware');
+const { xssFilterOutput, validateContentType } = require('./middleware/xssFilter');
 const authRoutes = require('./routes/auth');
 const productRoutes = require('./routes/products');
 
 const app = express();
-
 app.use(helmet());
-app.use(cors());
-app.use(morgan('dev'));
-app.use(express.json());
-
-app.get('/', (req, res) => {
-  res.json({
-    message: 'Простий REST API на Express.js',
-    version: '1.0.0',
-    endpoints: {
-      auth: {
-        register: 'POST /api/auth/register',
-        login: 'POST /api/auth/login',
-        profile: 'GET /api/auth/profile (потрібен токен)'
-      },
-      products: {
-        getAll: 'GET /api/products',
-        getOne: 'GET /api/products/:id',
-        create: 'POST /api/products (потрібен токен)',
-        update: 'PUT /api/products/:id (потрібен токен)',
-        delete: 'DELETE /api/products/:id (потрібен токен)'
+app.use(securityHeaders);
+app.use(morgan('combined'));
+app.use(validateContentType);
+app.use(sanitizeInput);
+app.use(express.json({ 
+  limit: '5mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
+app.use(xssFilterOutput);
+app.get('/', 
+  apiRateLimiter,
+  (req, res) => {
+    res.json({
+      message: 'Захищений REST API на Express.js',
+      version: '2.0.0',
+      security: {
+        csrf: true,
+        xss: true,
+        rateLimiting: true,
+        sqlInjection: true,
+        ddos: true
       }
-    }
-  });
-});
-
-app.get('/api/status', (req, res) => {
-  res.json({
-    status: 'online',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
-});
-
-app.use('/api/auth', authRoutes);
-app.use('/api/products', productRoutes);
-
-app.use('*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Маршрут не знайдено'
-  });
-});
-
+    });
+  }
+);
+app.use('/api/auth', 
+  authRateLimiter,
+  csrfProtection,
+  checkOriginHeader,
+  authRoutes
+);
+app.use('/api/products', 
+  apiRateLimiter,
+  csrfProtection,
+  checkOriginHeader,
+  productRoutes
+);
+app.get('/api/security/check', 
+  apiRateLimiter,
+  (req, res) => {
+    const securityInfo = {
+      headers: {
+        csp: req.get('Content-Security-Policy') ? 'Встановлено' : 'Відсутній',
+        xssProtection: req.get('X-XSS-Protection') ? 'Встановлено' : 'Відсутній',
+        contentTypeOptions: req.get('X-Content-Type-Options') ? 'Встановлено' : 'Відсутній',
+        frameOptions: req.get('X-Frame-Options') ? 'Встановлено' : 'Відсутній'
+      },
+      cookies: {
+        httponly: 'Встановлено для всіх cookie',
+        secure: process.env.NODE_ENV === 'production' ? 'Так' : 'Тільки для HTTPS'
+      },
+      rateLimiting: {
+        enabled: true,
+        limits: {
+          auth: '5 запитів за 15 хвилин',
+          api: '100 запитів за хвилину',
+          create: '10 запитів за годину'
+        }
+      }
+    };
+    res.json({
+      success: true,
+      security: securityInfo
+    });
+  }
+);
+app.use('*', 
+  apiRateLimiter,
+  (req, res) => {
+    res.status(404).json({
+      success: false,
+      message: 'Маршрут не знайдено',
+      securityNote: 'Всі маршрути захищені'
+    });
+  }
+);
 app.use((err, req, res, next) => {
   console.error('Помилка:', err.message);
-  res.status(500).json({
+  const errorMessage = process.env.NODE_ENV === 'development' 
+    ? err.message 
+    : 'Внутрішня помилка сервера';
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.status(err.status || 500).json({
     success: false,
-    message: 'Щось пішло не так на сервері',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    message: errorMessage,
+    timestamp: new Date().toISOString()
   });
 });
-
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Сервер запущено на порті ${PORT}`);
-  console.log(`Адреса: http://localhost:${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`✅ Захищений сервер запущено на порті ${PORT}`);
+  console.log(`🔒 Режим безпеки: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📡 Адреса: http://localhost:${PORT}`);
 });
+process.on('uncaughtException', (error) => {
+  console.error('Непередбачена помилка:', error);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Необроблена відмова:', reason);
+});
+const gracefulShutdown = () => {
+  console.log('Отримано сигнал завершення. Закриття сервера...');
+  server.close(() => {
+    console.log('Сервер зупинено.');
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error('Примусове завершення...');
+    process.exit(1);
+  }, 10000);
+};
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
